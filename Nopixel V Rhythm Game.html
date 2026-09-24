@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rhythm Lanes</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+  :root{
+    --bg:#0b0b10; --panel:#131319; --line:#2a2a35; --text:#eef0f4; --muted:#8c8fa0;
+    --a:#3fd0ff; --b:#2be6ac; --c:#b06bff;
+    box-sizing:border-box;
+    padding-top:env(safe-area-inset-top,0px);
+    padding-bottom:env(safe-area-inset-bottom,0px);
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#eef0f4; --panel:#ffffff; --line:#d7dbe3; --text:#14161c; --muted:#6a6f80;
+    }
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100%; padding:20px; gap:12px;
+  }
+  h1{font-size:1.25rem; margin:0; letter-spacing:.2px}
+  .wrap{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:10px; box-shadow:0 10px 30px rgba(0,0,0,.2)}
+  canvas{display:block; border-radius:8px; max-width:min(92vw,760px); width:760px; height:420px}
+  .row{display:flex; align-items:center; gap:10px; font-size:.85rem; color:var(--muted); flex-wrap:wrap; justify-content:center}
+  .row b{color:var(--text)}
+  input[type=range]{width:160px}
+  .msg{min-height:1.5em; font-size:1rem; font-weight:600; text-align:center}
+  .msg.win{color:var(--b)}
+  .msg.lose{color:#ff5f6d}
+  button{border:none; background:var(--b); color:#052018; font-weight:700; padding:9px 18px; border-radius:10px; cursor:pointer; font-size:.9rem}
+  .hint{font-size:.78rem; color:var(--muted)}
+  .modeLabel{display:flex; align-items:center; gap:6px; cursor:pointer; font-size:.9rem}
+  .row.modes{gap:22px}
+</style>
+</head>
+<body>
+  <h1>Rhythm Lanes</h1>
+  <div class="wrap"><canvas id="c" width="760" height="420"></canvas></div>
+  <div class="row modes">
+    <label class="modeLabel"><input type="radio" name="mode" id="modeNopixel" checked> NoPixel V</label>
+    <label class="modeLabel"><input type="radio" name="mode" id="modeCustom"> Custom</label>
+  </div>
+  <div id="diffRows">
+    <div class="row">
+      <span>Speed</span>
+      <input type="range" id="speed" min="150" max="520" value="260">
+      <span id="speedVal">260</span>
+    </div>
+    <div class="row">
+      <span>Density</span>
+      <input type="range" id="density" min="1" max="10" value="5">
+      <span id="densityVal">5</span>
+      <span>Chords</span>
+      <input type="range" id="chord" min="0" max="10" value="6">
+      <span id="chordVal">6</span>
+      <span>Precision</span>
+      <input type="range" id="precision" min="1" max="10" value="6">
+      <span id="precisionVal">6</span>
+    </div>
+    <div class="hint">Density = how fast notes stack up · Chords = how often lanes overlap · Precision = how tight the hit window is. All four push difficulty up as you raise them.</div>
+  </div>
+  <div class="msg" id="msg">Press A / S / D as each diamond crosses its line</div>
+  <button id="startBtn">Start</button>
+
+<script>
+(function(){
+  const cvs = document.getElementById('c'), ctx = cvs.getContext('2d');
+  const W = cvs.width, H = cvs.height;
+  const speedSlider = document.getElementById('speed'), speedVal = document.getElementById('speedVal');
+  const densitySlider = document.getElementById('density'), densityVal = document.getElementById('densityVal');
+  const chordSlider = document.getElementById('chord'), chordVal = document.getElementById('chordVal');
+  const precisionSlider = document.getElementById('precision'), precisionVal = document.getElementById('precisionVal');
+  const modeNopixel = document.getElementById('modeNopixel'), modeCustom = document.getElementById('modeCustom');
+  const diffRows = document.getElementById('diffRows');
+
+  const NOPIXEL_PRESET = { speed:390, density:8, chord:6, precision:3 };
+
+  function applyPreset(){
+    speedSlider.value = NOPIXEL_PRESET.speed;
+    densitySlider.value = NOPIXEL_PRESET.density;
+    chordSlider.value = NOPIXEL_PRESET.chord;
+    precisionSlider.value = NOPIXEL_PRESET.precision;
+    speedVal.textContent = speedSlider.value;
+    densityVal.textContent = densitySlider.value;
+    chordVal.textContent = chordSlider.value;
+    precisionVal.textContent = precisionSlider.value;
+  }
+
+  function updateMode(){
+    if(modeNopixel.checked){
+      applyPreset();
+      diffRows.style.display = 'none';
+    } else {
+      diffRows.style.display = '';
+    }
+  }
+  const msgEl = document.getElementById('msg'), startBtn = document.getElementById('startBtn');
+
+  const LANES = [
+    {label:'TRACK A', key:'a', keyLabel:'A', color:getVar('--a'), y:70},
+    {label:'TRACK B', key:'s', keyLabel:'S', color:getVar('--b'), y:195},
+    {label:'TRACK C', key:'d', keyLabel:'D', color:getVar('--c'), y:320}
+  ];
+  function getVar(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+  const laneH = 110;
+  const hitX = 130;      // vertical hit line, near left like the reference
+  const spawnX = W - 30; // notes enter from the right
+  const TOTAL = 24;
+  const MAX_MISSES = 6;
+
+  function toleranceValue(){
+    // Precision 1 (loose) -> 10 (tight): bigger number, smaller hit window
+    const p = parseFloat(precisionSlider.value);
+    return 36 - p * 1.8; // ~34px down to ~18px
+  }
+  function spawnIntervalValue(){
+    // Density 1 (sparse) -> 10 (packed): bigger number, less time between notes
+    const d = parseFloat(densitySlider.value);
+    return 900 - d * 60; // ~840ms down to ~300ms
+  }
+  function chordMaxChance(){
+    // Chords 0 (never) -> 10 (frequent): caps how often lanes overlap late-game
+    const c = parseFloat(chordSlider.value);
+    return c / 10 * 0.7;
+  }
+
+  let notes, spawned, resolved, streak, misses, running, lastTime, spawnTimer, flashes;
+
+  function reset(){
+    notes = []; spawned = 0; resolved = 0; streak = 0; misses = 0;
+    running = false; spawnTimer = 0; flashes = [];
+    speedVal.textContent = speedSlider.value;
+    densityVal.textContent = densitySlider.value;
+    chordVal.textContent = chordSlider.value;
+    precisionVal.textContent = precisionSlider.value;
+    [speedSlider, densitySlider, chordSlider, precisionSlider, modeNopixel, modeCustom].forEach(s => s.disabled = false);
+    msgEl.className = 'msg';
+    msgEl.textContent = 'Press A / S / D as each diamond crosses its line';
+    startBtn.textContent = 'Start';
+    startBtn.disabled = false;
+    draw();
+  }
+
+  function start(){
+    if(running) return;
+    reset();
+    running = true;
+    msgEl.textContent = '';
+    startBtn.disabled = true;
+    [speedSlider, densitySlider, chordSlider, precisionSlider, modeNopixel, modeCustom].forEach(s => s.disabled = true);
+    lastTime = performance.now();
+    requestAnimationFrame(loop);
+  }
+
+  function speedPxPerSec(){ return parseFloat(speedSlider.value); }
+
+  function spawnNote(){
+    // as the run progresses, sometimes drop two notes at once across different
+    // lanes so the player has to hit two keys together
+    const progress = spawned / TOTAL;
+    const maxChance = chordMaxChance();
+    const chordChance = progress > 0.55 ? Math.min(maxChance, (progress - 0.55) / 0.45 * maxChance) : 0;
+    const canChord = spawned <= TOTAL - 2;
+    if(canChord && Math.random() < chordChance){
+      let l1 = Math.floor(Math.random()*3), l2;
+      do{ l2 = Math.floor(Math.random()*3); } while(l2 === l1);
+      notes.push({lane:l1, x: spawnX, hit:false});
+      notes.push({lane:l2, x: spawnX, hit:false});
+      spawned += 2;
+    } else {
+      const lane = Math.floor(Math.random()*3);
+      notes.push({lane, x: spawnX, hit:false});
+      spawned++;
+    }
+  }
+
+  function loop(now){
+    if(!running) return;
+    const dt = Math.min(now - lastTime, 50) / 1000;
+    lastTime = now;
+    spawnTimer += dt*1000;
+    if(spawned < TOTAL && spawnTimer >= spawnIntervalValue()){
+      spawnTimer = 0; spawnNote();
+    }
+    const v = speedPxPerSec();
+    for(const n of notes){
+      if(n.hit) continue;
+      n.x -= v * dt;
+    }
+    // resolve misses: note scrolled well past the hit line unpressed
+    for(const n of notes){
+      if(!n.hit && n.x < hitX - toleranceValue() - 40){
+        n.hit = true; n.missed = true;
+        resolved++; misses++; streak = 0;
+        flash(n.lane, false);
+      }
+    }
+    notes = notes.filter(n => !(n.hit && !n.anim) || n.anim);
+    // fade animations
+    flashes = flashes.filter(f => (performance.now() - f.t) < 260);
+
+    draw();
+
+    if(misses >= MAX_MISSES){ endGame(false); return; }
+    if(resolved >= TOTAL && spawned >= TOTAL){ endGame(true); return; }
+    requestAnimationFrame(loop);
+  }
+
+  function flash(laneIdx, good){
+    flashes.push({lane:laneIdx, t:performance.now(), good});
+  }
+
+  function tryHit(laneIdx){
+    if(!running) return;
+    let best = null, bestDist = Infinity;
+    for(const n of notes){
+      if(n.hit || n.lane !== laneIdx) continue;
+      const d = Math.abs(n.x - hitX);
+      if(d <= toleranceValue() && d < bestDist){ best = n; bestDist = d; }
+    }
+    if(best){
+      best.hit = true; best.good = true;
+      resolved++; streak++;
+      flash(laneIdx, true);
+    } else {
+      flash(laneIdx, false);
+    }
+  }
+
+  function endGame(won){
+    running = false;
+    startBtn.disabled = false;
+    [speedSlider, densitySlider, chordSlider, precisionSlider, modeNopixel, modeCustom].forEach(s => s.disabled = false);
+    startBtn.textContent = 'Play again';
+    if(won){
+      msgEl.className = 'msg win';
+      msgEl.textContent = 'Clear! ' + (TOTAL-misses) + '/' + TOTAL + ' hit, ' + misses + ' missed';
+    } else {
+      msgEl.className = 'msg lose';
+      msgEl.textContent = 'Out of misses — ' + resolved + '/' + TOTAL + ' notes reached';
+    }
+    draw();
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle = getVar('--bg');
+    ctx.fillRect(0,0,W,H);
+
+    LANES.forEach((lane, i) => {
+      const top = lane.y - laneH/2 + 20;
+      // lane separators
+      ctx.strokeStyle = getVar('--line');
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(0, lane.y+40); ctx.lineTo(W, lane.y+40); ctx.stroke();
+
+      // label
+      ctx.fillStyle = getVar('--muted');
+      ctx.font = '600 11px -apple-system, sans-serif';
+      ctx.fillText(lane.label, 10, lane.y - 34);
+
+      // hit line (double bar)
+      ctx.strokeStyle = lane.color;
+      ctx.globalAlpha = 0.85;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(hitX-4, lane.y-38); ctx.lineTo(hitX-4, lane.y+38); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(hitX+4, lane.y-38); ctx.lineTo(hitX+4, lane.y+38); ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      // key badge
+      ctx.strokeStyle = lane.color;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(W-58, lane.y-16, 32, 32);
+      ctx.fillStyle = lane.color;
+      ctx.font = '700 15px -apple-system, sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(lane.keyLabel, W-42, lane.y+1);
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    });
+
+    // notes
+    for(const n of notes){
+      if(n.hit && !n.missed && n.good) continue; // hit notes vanish instantly
+      const lane = LANES[n.lane];
+      const alpha = n.missed ? 0.35 : 1;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(n.x, lane.y);
+      ctx.rotate(Math.PI/4);
+      const s = 15;
+      ctx.strokeStyle = lane.color;
+      ctx.lineWidth = 2.5;
+      ctx.fillStyle = lane.color + '22';
+      ctx.beginPath();
+      ctx.rect(-s, -s, s*2, s*2);
+      ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+
+    // hit-line flashes
+    const nowT = performance.now();
+    for(const f of flashes){
+      const age = nowT - f.t;
+      const a = Math.max(0, 1 - age/260);
+      const lane = LANES[f.lane];
+      ctx.globalAlpha = a*0.5;
+      ctx.fillStyle = f.good ? lane.color : '#ff5f6d';
+      ctx.beginPath(); ctx.arc(hitX, lane.y, 26*(1+age/260*0.6), 0, Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // bottom hud — text row sits clear of the lanes above and the bar below
+    const textY = H - 36;
+    ctx.font = '600 12px -apple-system, sans-serif';
+    ctx.fillStyle = getVar('--muted');
+    ctx.fillText('PROGRESS', 10, textY);
+    ctx.fillStyle = getVar('--text');
+    ctx.fillText(String(resolved) + ' / ' + TOTAL, 96, textY);
+    ctx.fillStyle = getVar('--muted');
+    ctx.fillText('STREAK', 180, textY);
+    ctx.fillStyle = getVar('--text');
+    ctx.fillText(String(streak), 240, textY);
+    ctx.fillStyle = getVar('--muted');
+    ctx.fillText('MISSES', 274, textY);
+    ctx.fillStyle = misses > 0 ? '#ff5f6d' : getVar('--text');
+    ctx.fillText(String(misses) + ' / ' + MAX_MISSES, 334, textY);
+
+    // progress bar — a clear gap below the text row
+    const barX = 10, barW = W - 20, barY = H - 22, barH = 8;
+    ctx.strokeStyle = getVar('--line'); ctx.lineWidth = 1;
+    ctx.strokeRect(barX, barY, barW, barH);
+    ctx.fillStyle = getVar('--b');
+    ctx.fillRect(barX, barY, barW * Math.min(1, resolved/TOTAL), barH);
+  }
+
+  speedSlider.addEventListener('input', () => speedVal.textContent = speedSlider.value);
+  densitySlider.addEventListener('input', () => densityVal.textContent = densitySlider.value);
+  chordSlider.addEventListener('input', () => chordVal.textContent = chordSlider.value);
+  precisionSlider.addEventListener('input', () => precisionVal.textContent = precisionSlider.value);
+  modeNopixel.addEventListener('change', updateMode);
+  modeCustom.addEventListener('change', updateMode);
+  updateMode();
+  startBtn.addEventListener('click', start);
+  document.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    const idx = LANES.findIndex(l => l.key === k);
+    if(idx >= 0){ tryHit(idx); e.preventDefault(); }
+  });
+
+  reset();
+})();
+</script>
+</body>
+</html>
